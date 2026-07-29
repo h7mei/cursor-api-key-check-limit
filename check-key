@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly API_URL="https://api.cursor.com/v1/me"
+readonly API_BASE="https://api.cursor.com/v1"
 readonly TIMEOUT=15
+readonly HELLO_POLL_SECONDS=5
+readonly HELLO_MAX_WAIT_SECONDS=180
+readonly HELLO_PROMPT='Reply with exactly one short hello sentence. Do not use tools, edit files, or run commands.'
 
 API_KEY="${1:-${CURSOR_API_KEY:-}}"
 
@@ -13,6 +16,11 @@ fi
 
 if [[ -z "$API_KEY" ]]; then
   echo "error: no API key (pass argument or set CURSOR_API_KEY)" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 is required" >&2
   exit 1
 fi
 
@@ -28,7 +36,7 @@ CURL_META="$(
     -w "%{http_code} %{time_total}" \
     --max-time "$TIMEOUT" \
     -u "${API_KEY}:" \
-    "$API_URL" \
+    "${API_BASE}/me" \
     2>/dev/null
 )" && CURL_OK=1 || CURL_OK=0
 
@@ -70,8 +78,7 @@ fi
 
 BODY="$(cat "$TMP_BODY")"
 
-if command -v python3 >/dev/null 2>&1; then
-  BODY="$BODY" HTTP_CODE="$HTTP_CODE" TIME_TOTAL="$TIME_TOTAL" RETRY_AFTER="$RETRY_AFTER" python3 - <<'PY'
+BODY="$BODY" HTTP_CODE="$HTTP_CODE" TIME_TOTAL="$TIME_TOTAL" RETRY_AFTER="$RETRY_AFTER" python3 - <<'PY'
 import json, os
 
 body = os.environ.get("BODY") or ""
@@ -113,32 +120,251 @@ elif body.strip():
     msg = data.get("message") or data.get("error") or body.strip()[:200]
     print(f"error:        {msg}")
 PY
-else
-  echo "valid:        $([ "$HTTP_CODE" = "200" ] && echo yes || echo no)"
-  echo "http_status:  $HTTP_CODE"
-  echo "latency_s:    $TIME_TOTAL"
-  [[ -n "$RETRY_AFTER" ]] && echo "retry_after:  $RETRY_AFTER"
-  if [[ "$HTTP_CODE" == "200" ]]; then
-    grep -oE '"apiKeyName"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$BODY" \
-      | head -1 \
-      | sed 's/.*"apiKeyName"[[:space:]]*:[[:space:]]*"//;s/"$//' \
-      | awk '{print "api_key_name: " $0}'
-    grep -oE '"createdAt"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$BODY" \
-      | head -1 \
-      | sed 's/.*"createdAt"[[:space:]]*:[[:space:]]*"//;s/"$//' \
-      | awk '{print "created_at:   " $0}'
-    grep -oE '"userEmail"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$BODY" \
-      | head -1 \
-      | sed 's/.*"userEmail"[[:space:]]*:[[:space:]]*"//;s/"$//' \
-      | awk '{print "user_email:   " $0}'
-  elif [[ -n "$BODY" ]]; then
-    echo "error:        $(printf '%s' "$BODY" | tr -d '\n' | head -c 200)"
-  fi
-fi
 
 case "$HTTP_CODE" in
-  200) exit 0 ;;
+  200) ;;
   429) exit 2 ;;
   000) exit 3 ;;
   *) exit 1 ;;
 esac
+
+# Valid key — probe a couple of models with a no-repo Cloud Agent hello.
+# Use env(1) so we don't reassign readonly shell vars.
+env \
+  API_KEY="$API_KEY" \
+  API_BASE="$API_BASE" \
+  TIMEOUT="$TIMEOUT" \
+  HELLO_POLL_SECONDS="$HELLO_POLL_SECONDS" \
+  HELLO_MAX_WAIT_SECONDS="$HELLO_MAX_WAIT_SECONDS" \
+  HELLO_PROMPT="$HELLO_PROMPT" \
+  python3 - <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from base64 import b64encode
+
+api_key = os.environ["API_KEY"]
+api_base = os.environ["API_BASE"].rstrip("/")
+timeout = int(os.environ["TIMEOUT"])
+poll_s = int(os.environ["HELLO_POLL_SECONDS"])
+max_wait_s = int(os.environ["HELLO_MAX_WAIT_SECONDS"])
+prompt = os.environ["HELLO_PROMPT"]
+
+auth = "Basic " + b64encode(f"{api_key}:".encode()).decode()
+
+
+def request(method, path, body=None, timeout_s=timeout):
+    data = None
+    headers = {"Authorization": auth, "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        f"{api_base}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            payload = {"error": raw[:300]}
+        return e.code, payload
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def pick_models(items, n=2):
+    preferred = ("composer-2", "composer-2.5", "auto", "claude-4.6-sonnet", "claude-4-sonnet")
+    by_id = {item.get("id"): item for item in items if item.get("id")}
+    chosen = []
+    for pid in preferred:
+        if pid in by_id and pid not in chosen:
+            chosen.append(pid)
+        if len(chosen) >= n:
+            return chosen
+    for item in items:
+        mid = item.get("id")
+        if mid and mid not in chosen:
+            chosen.append(mid)
+        if len(chosen) >= n:
+            break
+    return chosen
+
+
+def model_payload(model_id, items_by_id):
+    item = items_by_id.get(model_id) or {}
+    params = []
+    for variant in item.get("variants") or []:
+        if variant.get("isDefault"):
+            params = variant.get("params") or []
+            break
+    if not params:
+        for param in item.get("parameters") or []:
+            if param.get("id") == "fast":
+                values = {v.get("value") for v in (param.get("values") or [])}
+                if "true" in values:
+                    params = [{"id": "fast", "value": "true"}]
+                break
+    payload = {"id": model_id}
+    if params:
+        payload["params"] = params
+    return payload
+
+
+def delete_agent(agent_id):
+    if not agent_id:
+        return
+    request("DELETE", f"/agents/{agent_id}", timeout_s=timeout)
+
+
+def api_error_fields(payload):
+    """Normalize Cursor API error bodies into (code, message)."""
+    if not isinstance(payload, dict):
+        return "", str(payload)
+
+    code = payload.get("code") or ""
+    message = payload.get("message") or ""
+    err = payload.get("error")
+
+    if isinstance(err, dict):
+        code = code or err.get("code") or ""
+        message = message or err.get("message") or ""
+    elif isinstance(err, str) and not message:
+        message = err
+
+    if not message:
+        message = str(payload)
+    if not code and isinstance(message, str) and "usage_limit" in message.lower():
+        code = "usage_limit_exceeded"
+
+    return str(code or ""), " ".join(str(message).split())
+
+
+def print_create_status(http_status, payload):
+    code, message = api_error_fields(payload)
+    if code == "usage_limit_exceeded":
+        print("status:       usage_limit_exceeded")
+        print("cloud_agents: blocked")
+        print(f"detail:       {message}")
+        return code
+    status_label = code or "create_failed"
+    print(f"status:       {status_label}")
+    print(f"detail:       http {http_status}: {message}")
+    return code
+
+
+print()
+print("--- model hello ---")
+
+status, models_body = request("GET", "/models")
+if status != 200:
+    code, message = api_error_fields(models_body)
+    detail = f"{code}: {message}" if code else message
+    print(f"models:       unavailable (http {status}: {detail})")
+    sys.exit(0)
+
+items = models_body.get("items") or []
+model_ids = pick_models(items, 2)
+if not model_ids:
+    print("models:       none available")
+    sys.exit(0)
+
+items_by_id = {item.get("id"): item for item in items if item.get("id")}
+print(f"models:       {', '.join(model_ids)}")
+
+for idx, model_id in enumerate(model_ids):
+    display = (items_by_id.get(model_id) or {}).get("displayName") or model_id
+    print()
+    print(f"model:        {display} ({model_id})")
+    create_status, created = request(
+        "POST",
+        "/agents",
+        {
+            "prompt": {"text": prompt},
+            "model": model_payload(model_id, items_by_id),
+            "name": f"check-key hello {model_id}"[:100],
+        },
+        timeout_s=60,
+    )
+    if create_status not in (200, 201):
+        err_code = print_create_status(create_status, created)
+        if err_code == "usage_limit_exceeded":
+            remaining = model_ids[idx + 1 :]
+            if remaining:
+                print()
+                print(f"skipped:      {', '.join(remaining)} (same usage limit)")
+            break
+        continue
+
+    agent = created.get("agent") or {}
+    run = created.get("run") or {}
+    agent_id = agent.get("id")
+    run_id = run.get("id") or agent.get("latestRunId")
+    if not agent_id or not run_id:
+        print("status:       create_failed")
+        print(f"detail:       missing agent/run id: {created}")
+        delete_agent(agent_id)
+        continue
+
+    print(f"agent_id:     {agent_id}")
+    print(f"run_id:       {run_id}")
+
+    deadline = time.time() + max_wait_s
+    final = None
+    while time.time() < deadline:
+        poll_status, run_body = request(
+            "GET",
+            f"/agents/{agent_id}/runs/{run_id}",
+            timeout_s=timeout,
+        )
+        if poll_status != 200:
+            code, message = api_error_fields(run_body)
+            print("status:       poll_failed")
+            detail = f"{code}: {message}" if code else message
+            print(f"detail:       http {poll_status}: {detail}")
+            final = None
+            break
+        run_state = run_body.get("status") or "UNKNOWN"
+        if run_state in ("FINISHED", "ERROR", "CANCELLED", "EXPIRED"):
+            final = run_body
+            break
+        time.sleep(poll_s)
+    else:
+        print("status:       timeout")
+        print(f"detail:       no terminal status within {max_wait_s}s")
+        request("POST", f"/agents/{agent_id}/runs/{run_id}/cancel", timeout_s=timeout)
+        delete_agent(agent_id)
+        continue
+
+    if final is None:
+        delete_agent(agent_id)
+        continue
+
+    run_state = final.get("status") or "UNKNOWN"
+    print(f"status:       {run_state.lower()}")
+    if final.get("durationMs") is not None:
+        print(f"duration_s:   {final['durationMs'] / 1000:.3f}")
+    result = (final.get("result") or "").strip()
+    if result:
+        one_line = " ".join(result.split())
+        if len(one_line) > 240:
+            one_line = one_line[:237] + "..."
+        print(f"reply:        {one_line}")
+    elif run_state != "FINISHED":
+        print("detail:       no reply")
+
+    delete_agent(agent_id)
+
+# Key itself is valid; model hello is status-only.
+sys.exit(0)
+PY
