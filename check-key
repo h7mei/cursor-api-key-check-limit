@@ -1,25 +1,305 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-API_KEY="${1:-${CURSOR_API_KEY:-}}"
+readonly API_URL="https://api.cursor.com/v1/me"
+readonly DEFAULT_TIMEOUT=15
 
-if [[ -z "$API_KEY" ]]; then
-  echo "false"
-  exit 1
-fi
+MODE="bool" # bool | info | json
+TIMEOUT="$DEFAULT_TIMEOUT"
+API_KEY=""
+SHOW_HELP=0
 
-HTTP_CODE="$(
-  curl -sS -o /dev/null -w "%{http_code}" \
-    --max-time 15 \
-    -u "${API_KEY}:" \
-    "https://api.cursor.com/v1/me" \
-    2>/dev/null || echo "000"
-)"
+usage() {
+  cat <<'EOF'
+Usage: check-key [options] [API_KEY]
 
-if [[ "$HTTP_CODE" == "200" ]]; then
-  echo "true"
+Check whether a Cursor API key is valid via GET /v1/me.
+
+Key source (first match wins):
+  1. positional argument
+  2. $CURSOR_API_KEY
+
+Options:
+  -i, --info       Print key metadata (name, createdAt, user, …)
+  -j, --json       Print raw JSON body from /v1/me
+  -t, --timeout N  Request timeout in seconds (default: 15)
+  -h, --help       Show this help
+
+Default output (no flags): true or false
+
+Exit codes:
+  0  valid key
+  1  missing / invalid key
+  2  rate limited (HTTP 429)
+  3  network / request error
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      SHOW_HELP=1
+      shift
+      ;;
+    -i | --info)
+      MODE="info"
+      shift
+      ;;
+    -j | --json)
+      MODE="json"
+      shift
+      ;;
+    -t | --timeout)
+      if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ || "$2" -eq 0 ]]; then
+        echo "error: --timeout requires a positive integer" >&2
+        exit 1
+      fi
+      TIMEOUT="$2"
+      shift 2
+      ;;
+    --timeout=*)
+      TIMEOUT="${1#*=}"
+      if [[ ! "$TIMEOUT" =~ ^[0-9]+$ || "$TIMEOUT" -eq 0 ]]; then
+        echo "error: --timeout requires a positive integer" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "error: unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$API_KEY" ]]; then
+        echo "error: unexpected argument: $1" >&2
+        exit 1
+      fi
+      API_KEY="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ "$SHOW_HELP" -eq 1 ]]; then
+  usage
   exit 0
 fi
 
-echo "false"
-exit 1
+API_KEY="${API_KEY:-${CURSOR_API_KEY:-}}"
+
+if [[ -z "$API_KEY" ]]; then
+  if [[ "$MODE" == "bool" ]]; then
+    echo "false"
+  else
+    echo "error: no API key (pass argument or set CURSOR_API_KEY)" >&2
+  fi
+  exit 1
+fi
+
+TMP_BODY="$(mktemp)"
+TMP_HEADERS="$(mktemp)"
+trap 'rm -f "$TMP_BODY" "$TMP_HEADERS"' EXIT
+
+CURL_OK=0
+CURL_META="$(
+  curl -sS \
+    -o "$TMP_BODY" \
+    -D "$TMP_HEADERS" \
+    -w "%{http_code} %{time_total}" \
+    --max-time "$TIMEOUT" \
+    -u "${API_KEY}:" \
+    "$API_URL" \
+    2>/dev/null
+)" && CURL_OK=1 || CURL_OK=0
+
+if [[ "$CURL_OK" -ne 1 || -z "$CURL_META" ]]; then
+  HTTP_CODE="000"
+  TIME_TOTAL="0"
+else
+  HTTP_CODE="${CURL_META%% *}"
+  TIME_TOTAL="${CURL_META#* }"
+fi
+
+header_value() {
+  # Case-insensitive header lookup from curl -D dump.
+  local name="$1"
+  awk -v key="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" '
+    BEGIN { FS = ":[[:space:]]*" }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line == "") next
+      split(line, parts, FS)
+      name = parts[1]
+      # rebuild value in case it contained ": "
+      val = line
+      sub(/^[^:]*:[[:space:]]*/, "", val)
+      if (tolower(name) == key) {
+        print val
+        exit
+      }
+    }
+  ' "$TMP_HEADERS" 2>/dev/null || true
+}
+
+print_info() {
+  local body="$1"
+  local http_code="$2"
+  local time_total="$3"
+  local retry_after="$4"
+
+  if command -v python3 >/dev/null 2>&1; then
+    BODY="$body" HTTP_CODE="$http_code" TIME_TOTAL="$time_total" RETRY_AFTER="$retry_after" python3 - <<'PY'
+import json, os
+
+body = os.environ.get("BODY") or ""
+http_code = os.environ["HTTP_CODE"]
+time_total = os.environ.get("TIME_TOTAL") or ""
+retry_after = os.environ.get("RETRY_AFTER") or ""
+
+try:
+    data = json.loads(body) if body.strip() else {}
+except json.JSONDecodeError:
+    data = {}
+
+def get(*keys, default="-"):
+    for k in keys:
+        if k in data and data[k] not in (None, ""):
+            return data[k]
+    return default
+
+print(f"valid:        {'yes' if http_code == '200' else 'no'}")
+print(f"http_status:  {http_code}")
+if time_total:
+    try:
+        print(f"latency_s:    {float(time_total):.3f}")
+    except ValueError:
+        print(f"latency_s:    {time_total}")
+if retry_after:
+    print(f"retry_after:  {retry_after}")
+
+if http_code == "200":
+    print(f"api_key_name: {get('apiKeyName')}")
+    print(f"created_at:   {get('createdAt')}")
+    print(f"user_id:      {get('userId')}")
+    print(f"user_email:   {get('userEmail')}")
+    first = get("userFirstName", default="")
+    last = get("userLastName", default="")
+    name = (f"{first} {last}").strip() or "-"
+    print(f"user_name:    {name}")
+elif body.strip():
+    msg = data.get("message") or data.get("error") or body.strip()[:200]
+    print(f"error:        {msg}")
+PY
+  else
+    echo "valid:        $([ "$http_code" = "200" ] && echo yes || echo no)"
+    echo "http_status:  $http_code"
+    echo "latency_s:    $time_total"
+    [[ -n "$retry_after" ]] && echo "retry_after:  $retry_after"
+    if [[ "$http_code" == "200" ]]; then
+      grep -oE '"apiKeyName"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
+        | head -1 \
+        | sed 's/.*"apiKeyName"[[:space:]]*:[[:space:]]*"//;s/"$//' \
+        | awk '{print "api_key_name: " $0}'
+      grep -oE '"createdAt"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
+        | head -1 \
+        | sed 's/.*"createdAt"[[:space:]]*:[[:space:]]*"//;s/"$//' \
+        | awk '{print "created_at:   " $0}'
+      grep -oE '"userEmail"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
+        | head -1 \
+        | sed 's/.*"userEmail"[[:space:]]*:[[:space:]]*"//;s/"$//' \
+        | awk '{print "user_email:   " $0}'
+    elif [[ -n "$body" ]]; then
+      echo "error:        $(printf '%s' "$body" | tr -d '\n' | head -c 200)"
+    fi
+  fi
+}
+
+RETRY_AFTER=""
+if [[ "$HTTP_CODE" == "429" ]]; then
+  RETRY_AFTER="$(header_value "retry-after")"
+  if [[ -z "$RETRY_AFTER" ]]; then
+    RETRY_AFTER="$(header_value "x-ratelimit-reset")"
+  fi
+fi
+
+case "$HTTP_CODE" in
+  200)
+    case "$MODE" in
+      bool) echo "true" ;;
+      json)
+        cat "$TMP_BODY"
+        echo
+        ;;
+      info)
+        print_info "$(cat "$TMP_BODY")" "$HTTP_CODE" "$TIME_TOTAL" ""
+        ;;
+      *)
+        echo "error: unhandled mode: $MODE" >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+    ;;
+  429)
+    case "$MODE" in
+      bool) echo "false" ;;
+      json)
+        if [[ -s "$TMP_BODY" ]]; then
+          cat "$TMP_BODY"
+          echo
+        else
+          echo '{"error":"rate_limited","http_status":429}'
+        fi
+        ;;
+      info)
+        print_info "$(cat "$TMP_BODY")" "$HTTP_CODE" "$TIME_TOTAL" "$RETRY_AFTER"
+        ;;
+      *)
+        echo "error: unhandled mode: $MODE" >&2
+        exit 1
+        ;;
+    esac
+    exit 2
+    ;;
+  000)
+    case "$MODE" in
+      bool) echo "false" ;;
+      json) echo '{"error":"network_error","http_status":0}' ;;
+      info)
+        print_info "" "000" "$TIME_TOTAL" ""
+        ;;
+      *)
+        echo "error: unhandled mode: $MODE" >&2
+        exit 1
+        ;;
+    esac
+    exit 3
+    ;;
+  *)
+    case "$MODE" in
+      bool) echo "false" ;;
+      json)
+        if [[ -s "$TMP_BODY" ]]; then
+          cat "$TMP_BODY"
+          echo
+        else
+          echo "{\"error\":\"invalid_key\",\"http_status\":${HTTP_CODE}}"
+        fi
+        ;;
+      info)
+        print_info "$(cat "$TMP_BODY")" "$HTTP_CODE" "$TIME_TOTAL" ""
+        ;;
+      *)
+        echo "error: unhandled mode: $MODE" >&2
+        exit 1
+        ;;
+    esac
+    exit 1
+    ;;
+esac
