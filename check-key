@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+API_KEY="${1:-${CURSOR_API_KEY:-}}"
+
+if [[ -z "$API_KEY" ]]; then
+  echo "false"
+  exit 1
+fi
+
+HTTP_CODE="$(
+  curl -sS -o /dev/null -w "%{http_code}" \
+    --max-time 15 \
+    -u "${API_KEY}:" \
+    "https://api.cursor.com/v1/me" \
+    2>/dev/null || echo "000"
+)"
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+  echo "true"
+  exit 0
+fi
+
+echo "false"
+exit 1
