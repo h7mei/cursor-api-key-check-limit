@@ -1,36 +1,23 @@
 # cursor-api-key-check-limit
 
-Bash CLI that validates a Cursor API key against `GET /v1/me`. Default output is only `true` or `false`.
+Bash CLI that validates a Cursor API key against `GET /v1/me` and prints all available key metadata.
 
 ## Requirements
 
 - `bash`
 - `curl`
-- `python3` (optional — cleaner `--info` formatting)
+- `python3` (optional — cleaner formatting)
 
 ## Usage
 
 ```bash
-./check-key                         # $CURSOR_API_KEY → true/false
+./check-key                         # uses $CURSOR_API_KEY
 ./check-key "crsr_xxxxxxxx"         # key as argument
-./check-key -i                      # metadata + latency
-./check-key -j                      # raw /v1/me JSON
-./check-key -t 10                   # timeout in seconds (default: 15)
-./check-key -h                      # help
 ```
 
 Key source (first match wins): positional argument, then `$CURSOR_API_KEY`.
 
 ## Output
-
-### Default
-
-| Result  | Meaning                                                   |
-| ------- | --------------------------------------------------------- |
-| `true`  | Key is valid (`GET /v1/me` → `200`)                       |
-| `false` | Missing, invalid, rate-limited (`429`), or request failed |
-
-### `-i` / `--info`
 
 ```text
 valid:        yes
@@ -46,14 +33,6 @@ user_name:    Alex Rivera
 On `429`, also prints `retry_after` when `Retry-After` / reset headers are present.
 
 Service-account keys omit user fields (`user_id`, `user_email`, `user_name`).
-
-### `-j` / `--json`
-
-Prints the `/v1/me` response body. On network failure:
-
-```json
-{ "error": "network_error", "http_status": 0 }
-```
 
 ## Exit codes
 
